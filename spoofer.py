@@ -47,7 +47,7 @@ for stream in (sys.stdout, sys.stderr):
 
 # paths
 ROOT = Path(__file__).resolve().parent
-GAMES_FILE = ROOT.parent / "data" / "games.json"     # full game list, downloaded if absent
+GAMES_FILE = ROOT / "data" / "games.json"     # full game list, downloaded if absent
 STATE_FILE = ROOT / "science_state.json"             # token, cookie, cached auth
 
 ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
@@ -323,14 +323,29 @@ class State:
     @classmethod
     def load(cls) -> "State":
         if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("state is not an object")
+            except (json.JSONDecodeError, ValueError, OSError):
+                # corrupt file: keep a backup instead of crashing or silently overwriting it
+                try:
+                    STATE_FILE.replace(STATE_FILE.with_suffix(".json.bak"))
+                except OSError:
+                    pass
+                return cls()
             state = cls(**{k: data.get(k, v) for k, v in cls().__dict__.items() if k != "used_games"})
-            state.used_games = data.get("used_games", [])
+            used = data.get("used_games", [])
+            state.used_games = used if isinstance(used, list) else []
             return state
         return cls()
 
     def save(self) -> None:
         STATE_FILE.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        try:
+            os.chmod(STATE_FILE, 0o600)  # token lives here: owner-only where the OS supports it
+        except OSError:
+            pass
 
     @property
     def is_stale(self) -> bool:
@@ -609,14 +624,26 @@ class ScienceClient:
             print("headers:", json.dumps(headers, indent=2))
             print("body:", json.dumps(payload, indent=2))
             print("=" * 72)
-        request = urllib.request.Request(SCIENCE_URL, data=body, method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return response.status
-        except urllib.error.HTTPError as exc:
-            return exc.code
-        except Exception:
-            return 0
+        status = 0
+        for attempt in range(3):
+            request = urllib.request.Request(SCIENCE_URL, data=body, method="POST", headers=headers)
+            wait = 2 * (attempt + 1)
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return response.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                if status != 429:
+                    return status
+                try:
+                    wait = min(30.0, float(exc.headers.get("Retry-After", wait)))
+                except (TypeError, ValueError):
+                    pass
+            except Exception:
+                status = 0  # network hiccup: retry
+            if attempt < 2:
+                time.sleep(wait)
+        return status
 
 
 def _chunked(items: Sequence[Game], size: int) -> Iterator[Sequence[Game]]:
@@ -804,6 +831,7 @@ class App:
             entered = input(f"  {self.console.GREY}cookie:{self.console.RESET} ").strip()
             if entered:
                 self.state.cookie = entered
+                self.state.save()
                 self.console.ok("cookie", "updated")
             else:
                 self.console.info("cookie unchanged")
@@ -850,6 +878,9 @@ class App:
         except ValueError:
             C.err("input", "invalid count")
             return
+        if count <= 0:
+            C.err("input", "count must be at least 1")
+            return
         count = min(count, len(self.games))
 
         # prompt for hours
@@ -861,6 +892,10 @@ class App:
             return
 
         # select games: prefer unused, rotate through used if necessary
+        if hours <= 0:
+            C.err("input", "hours must be greater than 0")
+            return
+
         selected = self._select_games(count)
         if not selected:
             C.err("games", "none selected")
